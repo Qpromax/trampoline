@@ -25,18 +25,18 @@ namespace Trampoline {
     inline constexpr std::size_t DefaultBufferAlign = alignof(std::max_align_t);
 
     template<std::size_t BufferBytes = DefaultBufferSize, std::size_t Align = DefaultBufferAlign>
-    class Trampoline {
+    class Stack {
         static_assert(BufferBytes >= sizeof(void*), "Buffer must be at least pointer-sized");
 
     public:
-        Trampoline() = default;
-        ~Trampoline() = default;
+        Stack() = default;
+        ~Stack() = default;
 
-        Trampoline(const Trampoline&) = delete;
-        Trampoline& operator=(const Trampoline&) = delete;
+        Stack(const Stack&) = delete;
+        Stack& operator=(const Stack&) = delete;
 
-        Trampoline(Trampoline&&) noexcept = default;
-        Trampoline& operator=(Trampoline&&) noexcept = default;
+        Stack(Stack&&) noexcept = default;
+        Stack& operator=(Stack&&) noexcept = default;
 
         // emplace: construct in-place
         template<typename T, typename... Args>
