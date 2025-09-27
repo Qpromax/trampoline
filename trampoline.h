@@ -1,358 +1,289 @@
-//
 // Created by Qpromax on 2025/9/27.
-//
+// trampoline.h
+// Header-only high-performance heterogeneous stack with SOO and optimized moves
+// Requires C++17 (recommended C++20).
+
+#ifndef TRAMPOLINE_H
+#define TRAMPOLINE_H
 
 #include <type_traits>
 #include <utility>
-#include <memory>
 #include <vector>
 #include <stdexcept>
-#include <cassert>
-#include <iostream>
+#include <new>
+#include <cstddef>
+#include <cstring>
+#include <functional>
+#include <typeindex>
+#include <optional>
 
-// 值类别枚举
-enum class ValueCategory {
-    LValue, // 左值
-    RValue // 右值
-};
 
-// 栈元素元数据
-struct ElementMetadata {
-    ValueCategory category;
-    bool aboutToDestroy;
+namespace Trampoline {
+    struct bad_trampoline_cast : public std::bad_cast {
+        const char* what() const noexcept override { return "bad Trampoline cast"; }
+    };
 
-    ElementMetadata(ValueCategory c = ValueCategory::LValue, bool d = false)
-        : category(c), aboutToDestroy(d){}
-};
+    // Default small buffer size (in bytes)
+    inline constexpr std::size_t DefaultBufferSize = 16;
 
-// 类型擦除操作表
-struct TypeOperations {
-    void (*destructor)(void*);
+    // Template parameters:
+    // BufferBytes: size of in-place buffer per element (default 16)
+    // Align: alignment for the in-place buffer (default alignas(max_align_t))
+    template<std::size_t BufferBytes = DefaultBufferSize, std::size_t Align = alignof(std::max_align_t)>
+    class Trampoline {
+        static_assert(BufferBytes >= sizeof(void*), "Buffer must be at least pointer-sized");
 
-    void (*moveConstruct)(void* dest, void* src);
+    public:
+        Trampoline() = default;
+        ~Trampoline() = default;
 
-    void* (*getAddress)(void* storage);
-};
+        Trampoline(const Trampoline&) = delete;
+        Trampoline& operator=(const Trampoline&) = delete;
 
-// 小对象优化存储（16字节缓冲区）
-union Storage {
-    void* dynamic;
-    alignas(16) char buffer[16];
+        Trampoline(Trampoline&&) noexcept = default;
+        Trampoline& operator=(Trampoline&&) noexcept = default;
 
-    Storage() noexcept : dynamic(nullptr)
-    {
-    }
-
-    // 移动构造函数
-    Storage(Storage&& other) noexcept
-    {
-        if (this != &other)
+        // emplace: construct a T in-place in a new stack element
+        template<typename T, typename... Args>
+        void emplace(Args&&... args)
         {
-            dynamic = other.dynamic;
-            other.dynamic = nullptr;
-        }
-    }
-
-    // 移动赋值运算符
-    Storage& operator=(Storage&& other) noexcept
-    {
-        if (this != &other)
-        {
-            dynamic = other.dynamic;
-            other.dynamic = nullptr;
-        }
-        return *this;
-    }
-
-    // 禁用拷贝
-    Storage(const Storage&) = delete;
-
-    Storage& operator=(const Storage&) = delete;
-};
-
-// 栈元素实现
-class StackElementImpl {
-public:
-    // 默认构造函数（创建空元素）
-    StackElementImpl() : meta_(), ops_(nullptr){}
-
-    // 带参数的构造函数
-    template<typename T>
-    StackElementImpl(T&& value, ElementMetadata meta)
-        : meta_(meta), ops_(&operationsFor<std::decay_t<T> >)
-    {
-        construct(std::forward<T>(value));
-    }
-
-    // 移动构造函数
-    StackElementImpl(StackElementImpl&& other) noexcept
-        : meta_(other.meta_), ops_(other.ops_), storage_(std::move(other.storage_))
-    {
-        other.ops_ = nullptr; // 防止双重释放
-    }
-
-    // 移动赋值运算符
-    StackElementImpl& operator=(StackElementImpl&& other) noexcept
-    {
-        if (this != &other)
-        {
-            destroy();
-            meta_ = other.meta_;
-            ops_ = other.ops_;
-            storage_ = std::move(other.storage_);
-            other.ops_ = nullptr;
-        }
-        return *this;
-    }
-
-    // 析构函数
-    ~StackElementImpl()
-    {
-        destroy();
-    }
-
-    // 禁用拷贝
-    StackElementImpl(const StackElementImpl&) = delete;
-
-    StackElementImpl& operator=(const StackElementImpl&) = delete;
-
-    const ElementMetadata& metadata() const noexcept { return meta_; }
-
-    void* data() noexcept
-    {
-        return ops_ ? ops_->getAddress(&storage_) : nullptr;
-    }
-
-    const void* data() const noexcept
-    {
-        return ops_ ? ops_->getAddress(const_cast<Storage*>(&storage_)) : nullptr;
-    }
-
-    // 检查是否有效
-    bool valid() const noexcept
-    {
-        return ops_ != nullptr;
-    }
-
-private:
-    template<typename T>
-    static TypeOperations operationsFor;
-
-    // 构造元素
-    template<typename T>
-    void construct(T&& value)
-    {
-        using RawType = std::decay_t<T>;
-
-        if constexpr (sizeof(RawType) <= sizeof(Storage) &&
-                      alignof(RawType) <= alignof(Storage) &&
-                      std::is_nothrow_move_constructible_v<RawType>)
-        {
-            // 小对象优化：直接在缓冲区构造
-            new(&storage_.buffer) RawType(std::forward<T>(value));
-        } else
-        {
-            // 大对象：动态分配
-            storage_.dynamic = new RawType(std::forward<T>(value));
-        }
-    }
-
-    // 销毁元素
-    void destroy()
-    {
-        if (ops_)
-        {
-            ops_->destructor(&storage_);
-            ops_ = nullptr;
-        }
-    }
-
-    ElementMetadata meta_;
-    const TypeOperations* ops_;
-    Storage storage_;
-};
-
-// 类型操作表特化
-template<typename T>
-TypeOperations StackElementImpl::operationsFor = {
-    // 析构函数
-    [](void* storage) {
-        Storage* s = static_cast<Storage*>(storage);
-        if constexpr (sizeof(T) <= sizeof(Storage) &&
-                      alignof(T) <= alignof(Storage) &&
-                      std::is_nothrow_move_constructible_v<T>)
-        {
-            reinterpret_cast<T*>(s->buffer)->~T();
-        } else
-        {
-            delete static_cast<T*>(s->dynamic);
-        }
-    },
-    // 移动构造
-    [](void* dest, void* src) {
-        Storage* d = static_cast<Storage*>(dest);
-        Storage* s = static_cast<Storage*>(src);
-
-        if constexpr (sizeof(T) <= sizeof(Storage) &&
-                      alignof(T) <= alignof(Storage) &&
-                      std::is_nothrow_move_constructible_v<T>)
-        {
-            new(d->buffer) T(std::move(*reinterpret_cast<T*>(s->buffer)));
-        } else
-        {
-            d->dynamic = s->dynamic;
-            s->dynamic = nullptr;
-        }
-    },
-    // 获取数据指针
-    [](void* storage) -> void* {
-        Storage* s = static_cast<Storage*>(storage);
-        if constexpr (sizeof(T) <= sizeof(Storage) &&
-                      alignof(T) <= alignof(Storage) &&
-                      std::is_nothrow_move_constructible_v<T>)
-        {
-            return s->buffer;
-        } else
-        {
-            return s->dynamic;
-        }
-    }
-};
-
-// 高性能通用栈
-class HighPerfStack {
-public:
-    HighPerfStack() = default;
-
-    // 移动构造
-    HighPerfStack(HighPerfStack&& other) noexcept
-        : stack_(std::move(other.stack_))
-    {
-    }
-
-    // 移动赋值
-    HighPerfStack& operator=(HighPerfStack&& other) noexcept
-    {
-        stack_ = std::move(other.stack_);
-        return *this;
-    }
-
-    // 禁用拷贝
-    HighPerfStack(const HighPerfStack&) = delete;
-
-    HighPerfStack& operator=(const HighPerfStack&) = delete;
-
-    ~HighPerfStack() = default;
-
-    // 压栈（完美转发）
-    template<typename T>
-    void push(T&& value, bool aboutToDestroy = false)
-    {
-        ElementMetadata meta;
-        if constexpr (std::is_lvalue_reference_v<decltype(value)>)
-        {
-            meta.category = ValueCategory::LValue;
-        } else
-        {
-            meta.category = ValueCategory::RValue;
-        }
-        meta.aboutToDestroy = aboutToDestroy;
-
-        // 直接在vector中构造元素
-        stack_.emplace_back(std::forward<T>(value), meta);
-    }
-
-    // 弹出元素
-    void pop()
-    {
-        if (stack_.empty())
-        {
-            throw std::out_of_range("Stack is empty");
-        }
-        stack_.pop_back();
-    }
-
-    // 访问栈顶元素（指定类型）
-    template<typename T>
-    auto top() -> decltype(auto)
-    {
-        if (stack_.empty())
-        {
-            throw std::out_of_range("Stack is empty");
-        }
-        return getAs<T>(stack_.back());
-    }
-
-    // 访问栈顶元素（指定类型，const）
-    template<typename T>
-    auto top() const -> decltype(auto)
-    {
-        if (stack_.empty())
-        {
-            throw std::out_of_range("Stack is empty");
-        }
-        return getAs<T>(stack_.back());
-    }
-
-    // 获取元数据
-    const ElementMetadata& topMetadata() const
-    {
-        if (stack_.empty())
-        {
-            throw std::out_of_range("Stack is empty");
-        }
-        return stack_.back().metadata();
-    }
-
-    // 检查是否为空
-    bool empty() const noexcept
-    {
-        return stack_.empty();
-    }
-
-    // 获取大小
-    size_t size() const noexcept
-    {
-        return stack_.size();
-    }
-
-    // 预分配内存
-    void reserve(size_t capacity)
-    {
-        stack_.reserve(capacity);
-    }
-
-private:
-    // 类型安全的访问
-    template<typename T, typename Element>
-    static auto getAs(Element& element) -> decltype(auto)
-    {
-        using RawType = std::decay_t<T>;
-        void* data = element.data();
-
-        if (!data)
-        {
-            throw std::runtime_error("Invalid stack element");
+            elements_.push_back(Element::template create<T>(std::forward<Args>(args)...));
         }
 
-        if constexpr (std::is_lvalue_reference_v<T>)
+        // push: copy/move a value into the stack
+        template<typename T>
+        void push(T&& value)
         {
-            // 左值引用
-            return static_cast<std::add_lvalue_reference_t<RawType>>(
-                *static_cast<RawType*>(data)
-            );
-        } else if constexpr (std::is_rvalue_reference_v<T>)
-        {
-            // 右值引用
-            return static_cast<std::add_rvalue_reference_t<RawType>>(
-                std::move(*static_cast<RawType*>(data))
-            );
-        } else
-        {
-            // 值类型
-            return *static_cast<RawType*>(data);
+            emplace<std::decay_t<T> >(std::forward<T>(value));
         }
-    }
 
-    std::vector<StackElementImpl> stack_;
-};
+        // pop: remove top element
+        void pop()
+        {
+            if (elements_.empty()) throw std::out_of_range("Trampoline::pop on empty");
+            elements_.pop_back();
+        }
+
+        // topRaw: get void* pointer to the top object (or nullptr if empty)
+        void* topRaw()
+        {
+            if (elements_.empty()) throw std::out_of_range("Trampoline::topRaw on empty");
+            return elements_.back().getAddress();
+        }
+
+        const void* topRaw() const
+        {
+            if (elements_.empty()) throw std::out_of_range("Trampoline::topRaw on empty");
+            return elements_.back().getAddress();
+        }
+
+        // top<T>: type-safe access to the top element (throws bad_trampoline_cast on mismatch)
+        template<typename T>
+        T& top()
+        {
+            if (elements_.empty()) throw std::out_of_range("Trampoline::top on empty");
+            const auto& e = elements_.back();
+            if (e.type() != std::type_index(typeid(T))) throw bad_trampoline_cast();
+            return *reinterpret_cast<T*>(e.getAddress());
+        }
+
+        template<typename T>
+        const T& top() const
+        {
+            if (elements_.empty()) throw std::out_of_range("Trampoline::top on empty");
+            const auto& e = elements_.back();
+            if (e.type() != std::type_index(typeid(T))) throw bad_trampoline_cast();
+            return *reinterpret_cast<const T*>(e.getAddress());
+        }
+
+        // try_top<T>: returns optional reference (no exception)
+        template<typename T>
+        std::optional<std::reference_wrapper<T> > try_top()
+        {
+            if (elements_.empty()) return std::nullopt;
+            auto& e = elements_.back();
+            if (e.type() != std::type_index(typeid(T))) return std::nullopt;
+            return std::optional<std::reference_wrapper<T> >{std::ref(*reinterpret_cast<T*>(e.getAddress()))};
+        }
+
+        // check empty / size
+        bool empty() const noexcept { return elements_.empty(); }
+        std::size_t size() const noexcept { return elements_.size(); }
+
+        // reserve underlying storage
+        void reserve(std::size_t n) { elements_.reserve(n); }
+
+    private:
+        // Internal storage for small-object optimization
+        union Buffer {
+            alignas(Align) unsigned char bytes[BufferBytes];
+            void* as_ptr; // to ensure pointer-sized alignment operations are valid
+        };
+
+        // Element: type-erased holder that stores either object in Buffer or on heap
+        struct Element {
+            using Destructor = void(*)(Buffer*) noexcept;
+            using MoveConstruct = void(*)(Buffer* dest, Buffer* src) noexcept;
+            using GetAddress = void*(*)(Buffer*) noexcept;
+
+            Buffer buffer{};
+            void* heap_ptr{nullptr}; // for large objects
+            Destructor destructor{nullptr};
+            MoveConstruct moveConstruct{nullptr};
+            GetAddress getAddressFn{nullptr};
+            std::type_index type_idx{typeid(void)}; // runtime type info
+
+            Element() noexcept = default;
+
+            // create a new element for type T
+            template<typename T, typename... Args>
+            static Element create(Args&&... args)
+            {
+                Element e;
+                e.type_idx = std::type_index(typeid(T));
+
+                constexpr bool fitsBuffer = sizeof(T) <= BufferBytes && alignof(T) <= Align;
+                if constexpr (fitsBuffer)
+                {
+                    // choose fastest safe move strategy for T
+                    void* dest = static_cast<void*>(e.buffer.bytes);
+                    new(dest) T(std::forward<Args>(args)...);
+
+                    if constexpr (std::is_trivially_destructible_v<T>)
+                    {
+                        e.destructor = [](Buffer*) noexcept {
+                            /* nothing */
+                        };
+                    } else
+                    {
+                        e.destructor = [](Buffer* b) noexcept {
+                            T* p = std::launder(reinterpret_cast<T*>(b->bytes));
+                            p->~T();
+                        };
+                    }
+
+                    if constexpr (std::is_trivially_copyable_v<T>)
+                    {
+                        e.moveConstruct = [](Buffer* d, Buffer* s) noexcept {
+                            std::memcpy(d->bytes, s->bytes, sizeof(T));
+                        };
+                    } else if constexpr (std::is_nothrow_move_constructible_v<T> || std::is_nothrow_move_assignable_v<
+                                             T>)
+                    {
+                        e.moveConstruct = [](Buffer* d, Buffer* s) noexcept {
+                            T* src = std::launder(reinterpret_cast<T*>(s->bytes));
+                            void* dest = static_cast<void*>(d->bytes);
+                            new(dest) T(std::move(*src));
+                            // destroy source to avoid double-destruction
+                            src->~T();
+                        };
+                    } else
+                    {
+                        // fallback to copy-construct if move might throw
+                        e.moveConstruct = [](Buffer* d, Buffer* s) noexcept {
+                            T* src = std::launder(reinterpret_cast<T*>(s->bytes));
+                            void* dest = static_cast<void*>(d->bytes);
+                            new(dest) T(*src);
+                            src->~T();
+                        };
+                    }
+
+                    e.getAddressFn = [](Buffer* b) noexcept -> void* {
+                        return static_cast<void*>(b->bytes);
+                    };
+                } else
+                {
+                    // heap-allocated large object
+                    e.heap_ptr = new T(std::forward<Args>(args)...);
+                    e.destructor = [](Buffer* b) noexcept {
+                        delete reinterpret_cast<T*>(b->as_ptr);
+                    };
+                    e.moveConstruct = [](Buffer* d, Buffer* s) noexcept {
+                        // move pointer ownership
+                        d->as_ptr = s->as_ptr;
+                        s->as_ptr = nullptr;
+                    };
+                    e.getAddressFn = [](Buffer* b) noexcept -> void* {
+                        return reinterpret_cast<void*>(b->as_ptr);
+                    };
+                    // store pointer in the union area for convenience
+                    e.buffer.as_ptr = e.heap_ptr;
+                }
+
+                // wrap destructor to use buffer pointer semantics (heap case uses buffer.as_ptr)
+                if (!e.destructor)
+                {
+                    e.destructor = [](Buffer*) noexcept {
+                        /* no-op */
+                    };
+                }
+                if (!e.moveConstruct)
+                {
+                    e.moveConstruct = [](Buffer* d, Buffer* s) noexcept {
+                        /* no-op */
+                    };
+                }
+                if (!e.getAddressFn)
+                {
+                    e.getAddressFn = [](Buffer* b) noexcept -> void* { return static_cast<void*>(b->bytes); };
+                }
+
+                return e;
+            }
+
+            ~Element()
+            {
+                if (destructor) destructor(&buffer);
+            }
+
+            // move constructor for Element (used by vector during growth)
+            Element(Element&& other) noexcept
+            {
+                type_idx = other.type_idx;
+                destructor = other.destructor;
+                moveConstruct = other.moveConstruct;
+                getAddressFn = other.getAddressFn;
+                if (moveConstruct)
+                {
+                    moveConstruct(&buffer, &other.buffer);
+                }
+                // ensure other won't double-destroy
+                other.destructor = nullptr;
+                other.moveConstruct = nullptr;
+                other.getAddressFn = nullptr;
+                other.type_idx = std::type_index(typeid(void));
+            }
+
+            Element& operator=(Element&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    if (destructor) destructor(&buffer);
+                    type_idx = other.type_idx;
+                    destructor = other.destructor;
+                    moveConstruct = other.moveConstruct;
+                    getAddressFn = other.getAddressFn;
+                    if (moveConstruct) moveConstruct(&buffer, &other.buffer);
+                    other.destructor = nullptr;
+                    other.moveConstruct = nullptr;
+                    other.getAddressFn = nullptr;
+                    other.type_idx = std::type_index(typeid(void));
+                }
+                return *this;
+            }
+
+            // deleted copy
+            Element(const Element&) = delete;
+
+            Element& operator=(const Element&) = delete;
+
+            // helpers
+            void* getAddress() noexcept { return getAddressFn(&buffer); }
+            const void* getAddress() const noexcept { return getAddressFn(const_cast<Buffer*>(&buffer)); }
+            std::type_index type() const noexcept { return type_idx; }
+        };
+
+        std::vector<Element> elements_;
+    };
+}
+#endif // TRAMPOLINE_H
